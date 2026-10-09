@@ -11,6 +11,7 @@ See README.md for how to get the values.
 import base64
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -184,9 +185,91 @@ def build_prompt(messages):
             parts.append(f"[System: {c}]")
         elif role == "assistant":
             parts.append(f"Assistant: {c}")
+        elif role == "tool":
+            parts.append(f"[Tool result: {c}]")
         else:
             parts.append(f"User: {c}")
     return "\n".join(parts).strip()
+
+
+# ---------- homemade tools ----------
+
+def build_tools_prompt(tools):
+    defs = []
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") or {}
+        name = fn.get("name")
+        if not name:
+            continue
+        desc = fn.get("description") or "no description"
+        schema = json.dumps(fn.get("parameters") or {"type": "object", "properties": {}})
+        defs.append(f"- {name}: {desc}\n  parameters JSON schema: {schema}")
+    if not defs:
+        return ""
+    return "\n".join([
+        "[System: You have access to the following tools. When the user request needs one,",
+        "call it by emitting EXACTLY one fenced block like this and nothing else outside it.",
+        "The opening fence must be exactly ```toolcall (three backticks + the word toolcall).",
+        "Bare JSON without the fence is NOT a valid call.",
+        "",
+        "```toolcall",
+        '{"name": "<tool-name>", "arguments": {<args as JSON object>}}',
+        "```",
+        "",
+        "Rules: output ONLY the fenced block when calling a tool (no prose before/after).",
+        "If no tool is needed, answer normally in plain text without any fenced block.",
+        "Available tools:",
+        *defs,
+    ])
+
+
+def parse_tool_calls(text, tools):
+    names = set()
+    for t in tools or []:
+        if isinstance(t, dict):
+            n = (t.get("function") or {}).get("name")
+            if n:
+                names.add(n)
+    found = []
+    for m in re.finditer(r"```toolcall\s*([\s\S]*?)```", text or ""):
+        try:
+            obj = json.loads(m.group(1).strip())
+        except Exception:
+            continue
+        if isinstance(obj, dict) and obj.get("name") in names:
+            args = obj.get("arguments", {})
+            found.append({
+                "id": "call_" + uuid.uuid4().hex[:24],
+                "type": "function",
+                "function": {
+                    "name": obj["name"],
+                    "arguments": args if isinstance(args, str) else json.dumps(args),
+                },
+            })
+    if not found:
+        for m in re.finditer(
+            r'\{\s*"name"\s*:\s*"([A-Za-z0-9_-]+)"\s*,\s*"arguments"\s*:\s*(\{[\s\S]*?\})\s*\}',
+            text or "",
+        ):
+            if m.group(1) in names:
+                try:
+                    json.loads(m.group(2))
+                except Exception:
+                    continue
+                found.append({
+                    "id": "call_" + uuid.uuid4().hex[:24],
+                    "type": "function",
+                    "function": {"name": m.group(1), "arguments": m.group(2)},
+                })
+    return found
+
+
+def strip_toolcall(text):
+    t = re.sub(r"```toolcall\s*[\s\S]*?```", "", text or "")
+    t = re.sub(r"^\s*toolcall\s*(\{[\s\S]*\})\s*$", "", t, flags=re.M)
+    return t.strip()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -203,7 +286,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_sse(self, model, answer):
+    def _send_sse(self, model, answer, tool_calls=None):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -211,6 +294,23 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         cid = "chatcmpl-" + uuid.uuid4().hex
         now = int(time.time())
+        if tool_calls:
+            chunk = {"id": cid, "object": "chat.completion.chunk", "created": now,
+                     "model": model,
+                     "choices": [{"index": 0,
+                                  "delta": {"role": "assistant", "tool_calls": tool_calls},
+                                  "finish_reason": None}]}
+            self.wfile.write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8"))
+            done = {"id": cid, "object": "chat.completion.chunk", "created": now,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+            self.wfile.write(("data: " + json.dumps(done, ensure_ascii=False) + "\n\n").encode("utf-8"))
+            self.wfile.write(b"data: [DONE]\n\n")
+            try:
+                self.wfile.flush()
+            except Exception:
+                pass
+            return
         chunk = {"id": cid, "object": "chat.completion.chunk", "created": now,
                  "model": model,
                  "choices": [{"index": 0, "delta": {"role": "assistant", "content": answer},
@@ -243,6 +343,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": f"unknown model {model}, known: {sorted(MODELS)}"})
             return
         prompt = build_prompt(data.get("messages", []))
+        tools = data.get("tools") if isinstance(data.get("tools"), list) else []
+        want_tools = bool(tools) and data.get("tool_choice") != "none"
+        if want_tools:
+            tp = build_tools_prompt(tools)
+            if tp:
+                prompt = tp + "\n\n" + prompt
         if not prompt:
             self._json(400, {"error": "no prompt"})
             return
@@ -252,8 +358,28 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json(502, {"error": str(e)[:300]})
             return
+        calls = parse_tool_calls(answer, tools) if want_tools else []
         if data.get("stream"):
-            self._send_sse(model, answer)
+            self._send_sse(model, answer, calls or None)
+            return
+        if calls:
+            clean = strip_toolcall(answer)
+            self._json(200, {
+                "id": "chatcmpl-" + uuid.uuid4().hex,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{"index": 0,
+                             "message": {"role": "assistant", "content": clean or None,
+                                         "tool_calls": calls},
+                             "finish_reason": "tool_calls"}],
+                "usage": {
+                    "prompt_tokens": usage.get("inputTokens", max(1, len(prompt) // 4)),
+                    "completion_tokens": usage.get("outputTokens", max(1, len(answer) // 4)),
+                    "total_tokens": usage.get("inputTokens", 0) + usage.get("outputTokens", 0) or max(1, (len(prompt) + len(answer)) // 4),
+                },
+                "_secs": round(time.time() - t0, 2),
+            })
             return
         self._json(200, {
             "id": "chatcmpl-" + uuid.uuid4().hex,
